@@ -1,0 +1,7 @@
+WARNING: dump for 'msg1_img' looks truncated (no '-- Dump completed' marker).
+         mysqldump: mysqldump: Couldn't execute 'show fields from `expire`': Can't create/write to file '/tmp/#sql_39f_0.MAI' (Errcode: 13 "Permission denied") (1)
+WARNING: dump for 'msg1_img' contains 1 CREATE TABLE statements but DB has 2 tables.
+         mysqldump: mysqldump: Couldn't execute 'show fields from `expire`': Can't create/write to file '/tmp/#sql_39f_0.MAI' (Errcode: 13 "Permission denied") (1)
+
+
+
