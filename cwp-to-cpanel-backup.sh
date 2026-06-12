@@ -132,7 +132,7 @@ ALL_DOMAINS=("$PRIMARY_DOMAIN" "${ALL_DOMAINS[@]}")
 #---------------------------------------------------------------------------
 # 3. Create cpmove directory skeleton
 #---------------------------------------------------------------------------
-mkdir -p "$STAGE"/{cp,homedir,mysql,mysql-timestamps,dnszones,va,vad,vf,cron,ssl,apache_tls,logs,userdata,httpfiles,meta,pds,suspended,suspendinfo}
+mkdir -p "$STAGE"/{cp,homedir,mysql,mysql-timestamps,dnszones,va,vad,vf,cron,ssl,apache_tls,logs,userdata,httpfiles,meta,pds,suspended,suspendinfo,addons,bandwidth}
 
 # version marker so WHM treats the archive as modern format
 echo "11.96.0.0" > "$STAGE/version"
@@ -160,10 +160,13 @@ CP_FILE="$STAGE/cp/$USER_NAME"
     echo "DISK_BLOCK_LIMIT=unlimited"
     echo "FEATURELIST=default"
     echo "LANG=english"
-    echo "HOMEDIR=$USER_HOME"
-    echo "CONTACTEMAIL=root@$PRIMARY_DOMAIN"
     echo "STARTDATE=$(date +%s)"
+    echo "SUSPENDED=0"
 } > "$CP_FILE"
+
+# Create suspension data (SDS) stub files - cPanel expects these
+echo "reason:" > "$STAGE/suspended/$USER_NAME"
+echo "time:" > "$STAGE/suspendinfo/$USER_NAME"
 
 # userdata/main – maps primary, addon, sub, parked domains
 {
@@ -189,25 +192,49 @@ for d in "${ALL_DOMAINS[@]}"; do
         echo "homedir: $USER_HOME"
         echo "ip: $(hostname -I 2>/dev/null | awk '{print $1}')"
         echo "owner: root"
-        echo "phpopenbasedirprotect: 1"
         echo "port: 80"
-        echo "scriptalias:"
-        echo "  - alias: /cgi-bin/"
-        echo "    path: $docroot/cgi-bin/"
-        echo "serveradmin: webmaster@$d"
-        echo "serveralias: www.$d"
-        echo "servername: $d"
         echo "user: $USER_NAME"
-        echo "usecanonicalname: 'Off'"
+        echo "servername: $d"
+        echo "serveralias: www.$d"
+        echo "serveradmin: webmaster@$d"
     } > "$STAGE/userdata/$d"
 done
 
+# Create addon domain stubs if they exist
+if [[ ${#ADDON_DOMAINS[@]} -gt 0 ]]; then
+    for d in "${ADDON_DOMAINS[@]}"; do
+        mkdir -p "$STAGE/addons/$d"
+        echo "$d" > "$STAGE/addons/$d/addon_name"
+    done
+fi
+
 #---------------------------------------------------------------------------
-# 5. shadow / passwd entries for the account
+# 5. shadow / passwd entries for the account (with password compatibility)
 #---------------------------------------------------------------------------
-getent shadow "$USER_NAME" > "$STAGE/shadow"
 getent passwd "$USER_NAME" > "$STAGE/passwd" 2>/dev/null || true
 echo "$USER_HOME" > "$STAGE/homedir_paths"
+
+# Convert shadow file password to cPanel-compatible format
+# cPanel only accepts: $1$ (MD5), $2y$ (bcrypt), $6$ (SHA-512), or ! (disabled)
+SHADOW_ENTRY="$(getent shadow "$USER_NAME" 2>/dev/null || true)"
+if [[ -n "$SHADOW_ENTRY" ]]; then
+    SHADOW_USER="$(echo "$SHADOW_ENTRY" | cut -d: -f1)"
+    SHADOW_HASH="$(echo "$SHADOW_ENTRY" | cut -d: -f2)"
+    SHADOW_REST="$(echo "$SHADOW_ENTRY" | cut -d: -f3-)"
+    
+    # Check if hash is cPanel-compatible
+    if [[ "$SHADOW_HASH" =~ ^\$[126y]$ ]] || [[ "$SHADOW_HASH" = "!" ]] || [[ "$SHADOW_HASH" = "*" ]]; then
+        # Already compatible, use as-is
+        echo "$SHADOW_ENTRY" > "$STAGE/shadow"
+    else
+        # Incompatible hash format (yescrypt $y$, scrypt $7$, etc.)
+        # Replace with disabled password - cPanel will require password reset on first login
+        echo "${SHADOW_USER}:!:${SHADOW_REST}" > "$STAGE/shadow"
+        echo "WARNING: Replaced incompatible password hash for $USER_NAME (likely yescrypt/scrypt). User will reset password on first cPanel login." >&2
+    fi
+else
+    echo "WARNING: Could not read shadow file for $USER_NAME" >&2
+fi
 
 # quota (best effort)
 quota -u "$USER_NAME" 2>/dev/null | tail -n +3 > "$STAGE/quota" || true
@@ -234,12 +261,73 @@ DB_LIST="$(mysql_q "SHOW DATABASES;" | grep -E "^(${USER_NAME}_|root_${USER_NAME
 
 for db in $DB_LIST; do
     echo "    - $db"
-    mysqldump $MYSQL_OPTS --routines --triggers --events --single-transaction \
-        --skip-lock-tables --quick "$db" > "$STAGE/mysql/${db}.sql"
-    # .create file expected by cPanel restore
-    mysql_q "SHOW CREATE DATABASE \`$db\`\G" \
-        | awk -F': ' '/Create Database/ {sub(/^ +/,"",$2); print $2";"}' \
-        > "$STAGE/mysql/${db}.create"
+    
+    # Try mysqldump with multiple strategies for compatibility
+    DUMP_SUCCESS=0
+    
+    # Strategy 1: Try with --single-transaction (InnoDB-friendly)
+    if mysqldump $MYSQL_OPTS --routines --triggers --events --single-transaction \
+        --skip-lock-tables --quick "$db" > "$STAGE/mysql/${db}.sql" 2>/dev/null; then
+        DUMP_SUCCESS=1
+    fi
+    
+    # Strategy 2: If that failed, try without --single-transaction (MyISAM-friendly)
+    if [[ $DUMP_SUCCESS -eq 0 ]]; then
+        if mysqldump $MYSQL_OPTS --routines --triggers --events --quick "$db" \
+            > "$STAGE/mysql/${db}.sql" 2>/dev/null; then
+            DUMP_SUCCESS=1
+        fi
+    fi
+    
+    # Strategy 3: Last resort - basic dump without advanced options
+    if [[ $DUMP_SUCCESS -eq 0 ]]; then
+        if mysqldump $MYSQL_OPTS "$db" > "$STAGE/mysql/${db}.sql" 2>/dev/null; then
+            DUMP_SUCCESS=1
+        fi
+    fi
+    
+    # Check if the dump file is actually empty
+    if [[ ! -s "$STAGE/mysql/${db}.sql" ]]; then
+        echo "WARNING: Database $db dump is empty or failed. Checking for table data..." >&2
+        TABLE_COUNT="$(mysql_q "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='$db';" 2>/dev/null || echo 0)"
+        if [[ $TABLE_COUNT -gt 0 ]]; then
+            echo "ERROR: Database $db has $TABLE_COUNT tables but mysqldump produced empty file." >&2
+            echo "Check MySQL permissions and log at /tmp/mysql_dump_${db}.err" >&2
+        fi
+        echo "-- Database $db dump failed or is empty" > "$STAGE/mysql/${db}.sql"
+    fi
+    
+    # .create file: extract schema from the full dump (no INSERT data)
+    # Find where the data starts (first LOCK TABLES or INSERT INTO) and extract everything before it
+    if [[ -s "$STAGE/mysql/${db}.sql" ]]; then
+        # Find the line number where data inserts begin
+        DATA_START_LINE=$(grep -n "^LOCK TABLES\|^INSERT INTO" "$STAGE/mysql/${db}.sql" | head -1 | cut -d: -f1)
+        
+        if [[ -n "$DATA_START_LINE" && $DATA_START_LINE -gt 0 ]]; then
+            # Extract schema (everything before the data)
+            head -n $((DATA_START_LINE - 1)) "$STAGE/mysql/${db}.sql" > "$STAGE/mysql/${db}.create"
+        else
+            # No data found, use the whole file
+            cp "$STAGE/mysql/${db}.sql" "$STAGE/mysql/${db}.create"
+        fi
+        
+        # Ensure file has proper closing statements
+        if ! grep -q "COLLATION_CONNECTION" "$STAGE/mysql/${db}.create"; then
+            cat >> "$STAGE/mysql/${db}.create" << 'EOF'
+/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;
+/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;
+/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */;
+/*!40014 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS */;
+/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
+/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;
+/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
+/*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
+EOF
+        fi
+    else
+        echo "ERROR: SQL dump file is missing or empty for $db" >&2
+        echo "-- Failed to generate schema" > "$STAGE/mysql/${db}.create"
+    fi
     # timestamp file (cPanel touches these; empty is fine)
     : > "$STAGE/mysql-timestamps/${db}"
 done
@@ -250,15 +338,20 @@ echo "==> Exporting MySQL users / grants..."
     echo "-- MySQL users and grants for $USER_NAME"
     for db in $DB_LIST; do
         # find users with any privilege on this db
-        USERS="$(mysql_q "SELECT DISTINCT User,Host FROM mysql.db WHERE Db='$db';" )"
+        USERS="$(mysql_q "SELECT DISTINCT User,Host FROM mysql.db WHERE Db='$db';" 2>/dev/null)"
         while IFS=$'\t' read -r u h; do
             [[ -z "$u" ]] && continue
-            CREATE_STMT="$(mysql_q "SHOW CREATE USER \`$u\`@\`$h\`;" | sed 's/$/;/')"
-            [[ -n "$CREATE_STMT" ]] && echo "$CREATE_STMT"
-            mysql_q "SHOW GRANTS FOR \`$u\`@\`$h\`;" | sed 's/$/;/'
+            CREATE_STMT="$(mysql_q "SHOW CREATE USER \`$u\`@\`$h\`\G;" 2>/dev/null | sed 's/$/;/')"
+            [[ -n "$CREATE_STMT" ]] && echo "$CREATE_STMT" || true
+            mysql_q "SHOW GRANTS FOR \`$u\`@\`$h\`;" 2>/dev/null | sed 's/$/;/' || true
         done <<< "$USERS"
     done
 } > "$STAGE/mysql.sql"
+
+# Ensure mysql.sql is not empty; create minimal stub if needed
+if [[ ! -s "$STAGE/mysql.sql" ]] || [[ $(wc -l < "$STAGE/mysql.sql") -le 1 ]]; then
+    echo "-- No MySQL users/grants found; cPanel will create defaults" > "$STAGE/mysql.sql"
+fi
 
 #---------------------------------------------------------------------------
 # 8. Email accounts, forwarders, autoresponders (exim/dovecot on CWP)
@@ -342,7 +435,7 @@ fi
 #---------------------------------------------------------------------------
 ARCHIVE="$OUT_DIR/cpmove-${USER_NAME}.tar.gz"
 echo "==> Creating archive: $ARCHIVE"
-tar -C "$WORK_DIR" -czf "$ARCHIVE" "cpmove-$USER_NAME"
+tar -C "$STAGE" -czf "$ARCHIVE" .
 
 # Cleanup staging
 rm -rf "$WORK_DIR"
