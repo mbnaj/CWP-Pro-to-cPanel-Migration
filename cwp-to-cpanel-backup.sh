@@ -256,78 +256,70 @@ rsync -a \
 # 7. MySQL: databases, users, grants
 #---------------------------------------------------------------------------
 echo "==> Dumping MySQL databases..."
+
+# Sanity-check the MySQL connection so we don't silently produce empty dumps.
+if ! mysql $MYSQL_OPTS -NB -e "SELECT 1" >/dev/null 2>"$WORK_DIR/mysql_conn.err"; then
+    echo "ERROR: cannot connect to MySQL as root. mysqldump will be skipped." >&2
+    echo "       Details: $(cat "$WORK_DIR/mysql_conn.err")" >&2
+    echo "       Ensure /root/.my.cnf has working [client] credentials, then retry." >&2
+fi
+
 # CWP convention: dbs prefixed with <username>_  (sometimes root_<username>_)
 DB_LIST="$(mysql_q "SHOW DATABASES;" | grep -E "^(${USER_NAME}_|root_${USER_NAME}_)" || true)"
 
+if [[ -z "$DB_LIST" ]]; then
+    echo "    (no databases found matching ${USER_NAME}_* or root_${USER_NAME}_*)"
+fi
+
 for db in $DB_LIST; do
     echo "    - $db"
-    
-    # Try mysqldump with multiple strategies for compatibility
+
+    DUMP_ERR="$WORK_DIR/mysqldump_${db}.err"
     DUMP_SUCCESS=0
-    
-    # Strategy 1: Try with --single-transaction (InnoDB-friendly)
+
+    # Strategy 1: InnoDB-friendly (consistent snapshot, no locks)
     if mysqldump $MYSQL_OPTS --routines --triggers --events --single-transaction \
-        --skip-lock-tables --quick "$db" > "$STAGE/mysql/${db}.sql" 2>/dev/null; then
+        --skip-lock-tables --quick --hex-blob "$db" \
+        > "$STAGE/mysql/${db}.sql" 2>"$DUMP_ERR"; then
         DUMP_SUCCESS=1
     fi
-    
-    # Strategy 2: If that failed, try without --single-transaction (MyISAM-friendly)
+
+    # Strategy 2: MyISAM-friendly (no --single-transaction)
     if [[ $DUMP_SUCCESS -eq 0 ]]; then
-        if mysqldump $MYSQL_OPTS --routines --triggers --events --quick "$db" \
-            > "$STAGE/mysql/${db}.sql" 2>/dev/null; then
+        if mysqldump $MYSQL_OPTS --routines --triggers --events --quick --hex-blob "$db" \
+            > "$STAGE/mysql/${db}.sql" 2>"$DUMP_ERR"; then
             DUMP_SUCCESS=1
         fi
     fi
-    
-    # Strategy 3: Last resort - basic dump without advanced options
+
+    # Strategy 3: bare-minimum dump
     if [[ $DUMP_SUCCESS -eq 0 ]]; then
-        if mysqldump $MYSQL_OPTS "$db" > "$STAGE/mysql/${db}.sql" 2>/dev/null; then
+        if mysqldump $MYSQL_OPTS "$db" > "$STAGE/mysql/${db}.sql" 2>"$DUMP_ERR"; then
             DUMP_SUCCESS=1
         fi
     fi
-    
-    # Check if the dump file is actually empty
+
     if [[ ! -s "$STAGE/mysql/${db}.sql" ]]; then
-        echo "WARNING: Database $db dump is empty or failed. Checking for table data..." >&2
-        TABLE_COUNT="$(mysql_q "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='$db';" 2>/dev/null || echo 0)"
-        if [[ $TABLE_COUNT -gt 0 ]]; then
-            echo "ERROR: Database $db has $TABLE_COUNT tables but mysqldump produced empty file." >&2
-            echo "Check MySQL permissions and log at /tmp/mysql_dump_${db}.err" >&2
+        echo "ERROR: mysqldump produced an empty file for '$db'." >&2
+        if [[ -s "$DUMP_ERR" ]]; then
+            echo "       mysqldump said: $(head -1 "$DUMP_ERR")" >&2
         fi
-        echo "-- Database $db dump failed or is empty" > "$STAGE/mysql/${db}.sql"
+        # Keep an obvious marker so cPanel doesn't silently 'succeed' on garbage.
+        echo "-- mysqldump failed for $db; see CWP server logs" > "$STAGE/mysql/${db}.sql"
     fi
-    
-    # .create file: extract schema from the full dump (no INSERT data)
-    # Find where the data starts (first LOCK TABLES or INSERT INTO) and extract everything before it
-    if [[ -s "$STAGE/mysql/${db}.sql" ]]; then
-        # Find the line number where data inserts begin
-        DATA_START_LINE=$(grep -n "^LOCK TABLES\|^INSERT INTO" "$STAGE/mysql/${db}.sql" | head -1 | cut -d: -f1)
-        
-        if [[ -n "$DATA_START_LINE" && $DATA_START_LINE -gt 0 ]]; then
-            # Extract schema (everything before the data)
-            head -n $((DATA_START_LINE - 1)) "$STAGE/mysql/${db}.sql" > "$STAGE/mysql/${db}.create"
-        else
-            # No data found, use the whole file
-            cp "$STAGE/mysql/${db}.sql" "$STAGE/mysql/${db}.create"
-        fi
-        
-        # Ensure file has proper closing statements
-        if ! grep -q "COLLATION_CONNECTION" "$STAGE/mysql/${db}.create"; then
-            cat >> "$STAGE/mysql/${db}.create" << 'EOF'
-/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;
-/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;
-/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */;
-/*!40014 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS */;
-/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
-/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;
-/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
-/*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
-EOF
-        fi
-    else
-        echo "ERROR: SQL dump file is missing or empty for $db" >&2
-        echo "-- Failed to generate schema" > "$STAGE/mysql/${db}.create"
-    fi
+
+    # ----- .create file -----
+    # cPanel's restorepkg looks here for the CREATE DATABASE statement and
+    # uses it to (re)create the database before loading <db>.sql. If this
+    # file does NOT contain a CREATE DATABASE statement, cPanel never
+    # creates the DB and the restore is reported as "empty".
+    DB_CHARSET="$(mysql_q "SELECT DEFAULT_CHARACTER_SET_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$db';" 2>/dev/null)"
+    DB_COLLATE="$(mysql_q "SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$db';" 2>/dev/null)"
+    [[ -z "$DB_CHARSET" ]] && DB_CHARSET="utf8mb4"
+    [[ -z "$DB_COLLATE" ]] && DB_COLLATE="utf8mb4_general_ci"
+    printf 'CREATE DATABASE `%s` /*!40100 DEFAULT CHARACTER SET %s COLLATE %s */;\n' \
+        "$db" "$DB_CHARSET" "$DB_COLLATE" > "$STAGE/mysql/${db}.create"
+
     # timestamp file (cPanel touches these; empty is fine)
     : > "$STAGE/mysql-timestamps/${db}"
 done

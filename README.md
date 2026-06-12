@@ -73,16 +73,27 @@ sed -i 's/\r$//' cwp-to-cpanel-backup.sh
 sudo ./cwp-to-cpanel-backup.sh <cwp_username>
 ```
 
-### 4. `unbound variable` error around line ~128
+## Troubleshooting: cPanel reports the MySQL import as empty
 
-On CentOS 7 / CWP7 (bash 4.2) `set -u` aborts when an empty array is
-expanded — e.g. for an account that has no addon domains. The script no
-longer enables `set -u` for that reason. If you're running an older copy of
-the script that still has `set -u` near the top, simply remove that line:
+cPanel's `restorepkg` uses `mysql/<db>.create` to find a `CREATE DATABASE`
+statement and pre-create the database before loading `mysql/<db>.sql`. If
+`.create` does not contain a `CREATE DATABASE` statement, cPanel skips DB
+creation and reports an empty import even when `.sql` has data. The current
+script writes a proper `CREATE DATABASE` statement into `.create`.
+
+If you generated an archive with an older copy of the script, regenerate
+the backup with the latest version and restore again. To verify a generated
+archive before uploading:
 
 ```bash
-sed -i '/^set -u$/d' cwp-to-cpanel-backup.sh
+tar -tzf cpmove-<user>.tar.gz | grep '^./mysql/'
+# Inspect a .create file – it must start with: CREATE DATABASE `<dbname>` ...
+tar -xzOf cpmove-<user>.tar.gz ./mysql/<dbname>.create
 ```
+
+The script also prints explicit errors if `mysqldump` fails or if no
+databases match the CWP naming pattern (`<user>_*` or `root_<user>_*`),
+so re-run it and read the output if the dump is unexpectedly empty.
 
 ## What is captured
 
