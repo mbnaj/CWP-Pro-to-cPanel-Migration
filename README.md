@@ -21,6 +21,58 @@ sudo ./cwp-to-cpanel-backup.sh johndoe /root/backups
 
 If `output_dir` is omitted it defaults to `/root/cpmove-backups`.
 
+## Troubleshooting: `./cwp-to-cpanel-backup.sh: No such file or directory`
+
+This error on Linux almost always means one of the following. Try them in order:
+
+### 1. You're not in the directory that contains the script
+
+`./` means "current directory". Verify:
+
+```bash
+ls -l cwp-to-cpanel-backup.sh
+```
+
+If missing, `cd` to wherever you uploaded it (e.g. `cd /root`) and retry.
+
+### 2. The file isn't executable yet
+
+```bash
+chmod +x cwp-to-cpanel-backup.sh
+sudo ./cwp-to-cpanel-backup.sh <cwp_username>
+```
+
+### 3. Most likely: Windows line endings (CRLF)
+
+If the file was edited / downloaded on Windows, the shebang line becomes
+`#!/bin/bash\r`. Linux then tries to run an interpreter literally named
+`/bin/bash\r`, which doesn't exist — and prints the misleading message:
+
+```
+./cwp-to-cpanel-backup.sh: No such file or directory
+```
+
+Confirm with:
+
+```bash
+file cwp-to-cpanel-backup.sh
+# "...with CRLF line terminators"  => that's the cause
+```
+
+Fix it on the server:
+
+```bash
+# Option A – using dos2unix
+sudo yum install -y dos2unix   # CentOS / CWP7
+dos2unix cwp-to-cpanel-backup.sh
+
+# Option B – no extra package needed
+sed -i 's/\r$//' cwp-to-cpanel-backup.sh
+
+# Then run it
+sudo ./cwp-to-cpanel-backup.sh <cwp_username>
+```
+
 ## What is captured
 
 | Item | Destination in archive |
