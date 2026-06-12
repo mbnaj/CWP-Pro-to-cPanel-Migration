@@ -271,48 +271,115 @@ if [[ -z "$DB_LIST" ]]; then
     echo "    (no databases found matching ${USER_NAME}_* or root_${USER_NAME}_*)"
 fi
 
+# Detect server flavour / version so we can pick safe mysqldump options.
+MYSQL_VER="$(mysql_q "SELECT VERSION();" 2>/dev/null | head -1)"
+echo "    MySQL/MariaDB server reports: ${MYSQL_VER:-unknown}"
+
+# --set-gtid-purged=OFF is only valid on MySQL 5.6+ (not MariaDB). Probe it.
+GTID_OPT=""
+if mysqldump --help 2>/dev/null | grep -q -- '--set-gtid-purged'; then
+    GTID_OPT="--set-gtid-purged=OFF"
+fi
+# --column-statistics was added in MySQL 8.0 client and breaks against older
+# servers; disable it when supported.
+COLSTATS_OPT=""
+if mysqldump --help 2>/dev/null | grep -q -- '--column-statistics'; then
+    COLSTATS_OPT="--column-statistics=0"
+fi
+# --no-tablespaces avoids the PROCESS-privilege requirement on MySQL 8.0+.
+NOTBSP_OPT=""
+if mysqldump --help 2>/dev/null | grep -q -- '--no-tablespaces'; then
+    NOTBSP_OPT="--no-tablespaces"
+fi
+
+# Common safety options that materially improve restore reliability:
+#   --max-allowed-packet=1G  -> avoids "packet too large" on big BLOB rows
+#   --default-character-set=utf8mb4 -> preserves emoji / non-latin text
+#   --hex-blob               -> binary-safe BLOB / VARBINARY
+#   --add-drop-table         -> idempotent restore (overwrites stray tables)
+#   --skip-lock-tables       -> needed when we lack LOCK TABLES on some DBs
+MYSQLDUMP_COMMON=(
+    $MYSQL_OPTS
+    --max-allowed-packet=1G
+    --default-character-set=utf8mb4
+    --hex-blob
+    --add-drop-table
+    --skip-lock-tables
+    --routines
+    --triggers
+    --events
+    --quick
+    $GTID_OPT
+    $COLSTATS_OPT
+    $NOTBSP_OPT
+)
+
 for db in $DB_LIST; do
     echo "    - $db"
 
     DUMP_ERR="$WORK_DIR/mysqldump_${db}.err"
     DUMP_SUCCESS=0
 
-    # Strategy 1: InnoDB-friendly (consistent snapshot, no locks)
-    if mysqldump $MYSQL_OPTS --routines --triggers --events --single-transaction \
-        --skip-lock-tables --quick --hex-blob "$db" \
+    # Strategy 1: InnoDB-friendly consistent snapshot
+    if mysqldump "${MYSQLDUMP_COMMON[@]}" --single-transaction "$db" \
         > "$STAGE/mysql/${db}.sql" 2>"$DUMP_ERR"; then
         DUMP_SUCCESS=1
     fi
 
-    # Strategy 2: MyISAM-friendly (no --single-transaction)
+    # Strategy 2: drop --single-transaction (helps with MyISAM-only DBs)
     if [[ $DUMP_SUCCESS -eq 0 ]]; then
-        if mysqldump $MYSQL_OPTS --routines --triggers --events --quick --hex-blob "$db" \
+        if mysqldump "${MYSQLDUMP_COMMON[@]}" "$db" \
             > "$STAGE/mysql/${db}.sql" 2>"$DUMP_ERR"; then
             DUMP_SUCCESS=1
         fi
     fi
 
-    # Strategy 3: bare-minimum dump
+    # Strategy 3: minimal flags – last resort.
     if [[ $DUMP_SUCCESS -eq 0 ]]; then
-        if mysqldump $MYSQL_OPTS "$db" > "$STAGE/mysql/${db}.sql" 2>"$DUMP_ERR"; then
+        if mysqldump $MYSQL_OPTS --max-allowed-packet=1G --hex-blob \
+            --skip-lock-tables --add-drop-table $GTID_OPT $COLSTATS_OPT \
+            $NOTBSP_OPT "$db" > "$STAGE/mysql/${db}.sql" 2>"$DUMP_ERR"; then
             DUMP_SUCCESS=1
         fi
     fi
 
     if [[ ! -s "$STAGE/mysql/${db}.sql" ]]; then
         echo "ERROR: mysqldump produced an empty file for '$db'." >&2
-        if [[ -s "$DUMP_ERR" ]]; then
-            echo "       mysqldump said: $(head -1 "$DUMP_ERR")" >&2
+        [[ -s "$DUMP_ERR" ]] && sed 's/^/       mysqldump: /' "$DUMP_ERR" >&2
+        echo "-- mysqldump failed for $db; see backup log" > "$STAGE/mysql/${db}.sql"
+    else
+        # Verify completeness. mysqldump appends "-- Dump completed on ..."
+        # as its very last lines when it finished cleanly. A truncated dump
+        # (network hiccup, disk full, server kill) lacks this marker, even
+        # though the exit code can occasionally still be 0.
+        if ! tail -5 "$STAGE/mysql/${db}.sql" | grep -q -- '-- Dump completed'; then
+            echo "WARNING: dump for '$db' looks truncated (no '-- Dump completed' marker)." >&2
+            [[ -s "$DUMP_ERR" ]] && sed 's/^/         mysqldump: /' "$DUMP_ERR" >&2
         fi
-        # Keep an obvious marker so cPanel doesn't silently 'succeed' on garbage.
-        echo "-- mysqldump failed for $db; see CWP server logs" > "$STAGE/mysql/${db}.sql"
+
+        # Cross-check table counts to catch silent partial dumps.
+        SRC_TABLES="$(mysql_q "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='$db' AND TABLE_TYPE='BASE TABLE';" 2>/dev/null)"
+        DUMP_TABLES="$(grep -c '^CREATE TABLE ' "$STAGE/mysql/${db}.sql" || true)"
+        if [[ -n "$SRC_TABLES" && "$SRC_TABLES" -gt 0 && "$DUMP_TABLES" -lt "$SRC_TABLES" ]]; then
+            echo "WARNING: dump for '$db' contains $DUMP_TABLES CREATE TABLE statements but DB has $SRC_TABLES tables." >&2
+            [[ -s "$DUMP_ERR" ]] && sed 's/^/         mysqldump: /' "$DUMP_ERR" >&2
+        fi
+
+        # Strip DEFINER=`user`@`host` clauses. These are a very common
+        # cause of cPanel restore aborts ("Access denied for definer ...")
+        # which leaves the DB created but mostly empty.
+        sed -i -E \
+            -e 's/DEFINER=`[^`]*`@`[^`]*`//g' \
+            -e 's/DEFINER=[^ ]+ //g' \
+            -e 's/SQL SECURITY DEFINER/SQL SECURITY INVOKER/g' \
+            "$STAGE/mysql/${db}.sql"
     fi
 
     # ----- .create file -----
     # cPanel's restorepkg looks here for the CREATE DATABASE statement and
-    # uses it to (re)create the database before loading <db>.sql. If this
-    # file does NOT contain a CREATE DATABASE statement, cPanel never
-    # creates the DB and the restore is reported as "empty".
+    # uses it to (re)create the database before loading <db>.sql. Without
+    # a CREATE DATABASE here, cPanel never creates the DB and the restore
+    # is reported as "empty".
     DB_CHARSET="$(mysql_q "SELECT DEFAULT_CHARACTER_SET_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$db';" 2>/dev/null)"
     DB_COLLATE="$(mysql_q "SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$db';" 2>/dev/null)"
     [[ -z "$DB_CHARSET" ]] && DB_CHARSET="utf8mb4"
