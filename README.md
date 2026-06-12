@@ -21,6 +21,34 @@ sudo ./cwp-to-cpanel-backup.sh johndoe /root/backups
 
 If `output_dir` is omitted it defaults to `/root/cpmove-backups`.
 
+### Back up every CWP account at once
+
+Use `--all` to iterate over every CWP account on the server and produce one
+`cpmove-<user>.tar.gz` per account:
+
+```bash
+sudo ./cwp-to-cpanel-backup.sh --all [output_dir]
+```
+
+Example:
+
+```bash
+sudo ./cwp-to-cpanel-backup.sh --all /root/backups
+# -> /root/backups/cpmove-<user1>.tar.gz
+#    /root/backups/cpmove-<user2>.tar.gz
+#    ...
+#    /root/backups/cpmove-all-YYYYMMDD-HHMMSS.log   (combined run log)
+```
+
+Account discovery order:
+
+1. `SELECT username FROM root_cwp.user` (CWP's own database).
+2. Fallback: any `/home/<user>` with a real login shell.
+
+Each account is backed up in an isolated invocation, so a failure on one
+account does not stop the rest. A summary at the end lists how many
+succeeded, how many failed, and which accounts failed.
+
 ## Troubleshooting: `./cwp-to-cpanel-backup.sh: No such file or directory`
 
 This error on Linux almost always means one of the following. Try them in order:

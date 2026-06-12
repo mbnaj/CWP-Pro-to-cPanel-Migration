@@ -48,11 +48,99 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <cwp_username> [output_dir]" >&2
-    exit 1
+usage() {
+    cat >&2 <<EOF
+Usage:
+  $0 <cwp_username> [output_dir]      Back up a single account.
+  $0 --all [output_dir]               Back up every CWP account on this server.
+  $0 -h | --help                      Show this help.
+
+output_dir defaults to /root/cpmove-backups.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help|"")
+        usage
+        [[ -z "${1:-}" ]] && exit 1 || exit 0
+        ;;
+esac
+
+#---------------------------------------------------------------------------
+# 0a. --all mode: discover every CWP user and re-invoke ourselves per user.
+#---------------------------------------------------------------------------
+if [[ "$1" == "--all" ]]; then
+    ALL_OUT_DIR="${2:-/root/cpmove-backups}"
+    mkdir -p "$ALL_OUT_DIR"
+
+    SCRIPT_PATH="$(readlink -f "$0")"
+
+    # Minimal MySQL hookup so we can query CWP's user table.
+    _ALL_MYSQL_OPTS=""
+    [[ -f /root/.my.cnf ]] && _ALL_MYSQL_OPTS="--defaults-file=/root/.my.cnf"
+
+    # 1) Preferred source: CWP's own user table.
+    USERS="$(mysql $_ALL_MYSQL_OPTS -NB -e "SELECT username FROM root_cwp.user;" 2>/dev/null \
+        | awk 'NF' | sort -u)"
+
+    # 2) Fallback: any system account with a /home/<user> directory and a
+    #    real login shell (excludes root, system users, nologin accounts).
+    if [[ -z "$USERS" ]]; then
+        USERS="$(getent passwd \
+            | awk -F: '$6 ~ "^/home/" && $7 !~ /(nologin|false|sync|shutdown|halt)$/ {print $1}' \
+            | sort -u)"
+    fi
+
+    if [[ -z "$USERS" ]]; then
+        echo "ERROR: --all could not discover any CWP accounts." >&2
+        echo "       Tried root_cwp.user and /home/* with a login shell." >&2
+        exit 1
+    fi
+
+    TOTAL=$(echo "$USERS" | wc -l)
+    echo "==> --all: found $TOTAL account(s) to back up. Output dir: $ALL_OUT_DIR"
+    echo "$USERS" | sed 's/^/    - /'
+    echo
+
+    SUMMARY_LOG="$ALL_OUT_DIR/cpmove-all-$(date +%Y%m%d-%H%M%S).log"
+    OK_COUNT=0
+    FAIL_COUNT=0
+    FAILED_USERS=()
+
+    # Run each user as a fresh invocation so a failure in one doesn't kill
+    # the whole run. Stream output and tee into a summary log.
+    for u in $USERS; do
+        echo "============================================================" | tee -a "$SUMMARY_LOG"
+        echo "[$(date '+%F %T')] Backing up: $u"                              | tee -a "$SUMMARY_LOG"
+        echo "============================================================" | tee -a "$SUMMARY_LOG"
+        if bash "$SCRIPT_PATH" "$u" "$ALL_OUT_DIR" 2>&1 | tee -a "$SUMMARY_LOG"; then
+            OK_COUNT=$((OK_COUNT + 1))
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            FAILED_USERS+=("$u")
+        fi
+        echo | tee -a "$SUMMARY_LOG"
+    done
+
+    echo "============================================================"
+    echo " --all run complete."
+    echo "   Accounts processed : $TOTAL"
+    echo "   Succeeded          : $OK_COUNT"
+    echo "   Failed             : $FAIL_COUNT"
+    if [[ $FAIL_COUNT -gt 0 ]]; then
+        echo "   Failed accounts    : ${FAILED_USERS[*]}"
+    fi
+    echo "   Summary log        : $SUMMARY_LOG"
+    echo "   Archives in        : $ALL_OUT_DIR"
+    echo "============================================================"
+
+    [[ $FAIL_COUNT -gt 0 ]] && exit 1
+    exit 0
 fi
 
+#---------------------------------------------------------------------------
+# 0b. Single-account mode.
+#---------------------------------------------------------------------------
 USER_NAME="$1"
 OUT_DIR="${2:-/root/cpmove-backups}"
 
@@ -434,23 +522,101 @@ done
 
 # MySQL users + grants linked to those DBs -> mysql.sql
 echo "==> Exporting MySQL users / grants..."
+
+# Detect whether SHOW CREATE USER exists (MySQL 5.7+ / MariaDB 10.2+).
+HAVE_SHOW_CREATE_USER=0
+if mysql_q "SHOW CREATE USER 'root'@'localhost';" >/dev/null 2>&1; then
+    HAVE_SHOW_CREATE_USER=1
+fi
+
+# Detect the password column in mysql.user (Password vs authentication_string).
+PW_COL="authentication_string"
+if ! mysql_q "SELECT authentication_string FROM mysql.user LIMIT 1;" >/dev/null 2>&1; then
+    PW_COL="Password"
+fi
+
+# Collect every DB user that has privileges on any of this account's DBs,
+# deduplicated across databases.
+USERS_FILE="$WORK_DIR/db_users.tsv"
+: > "$USERS_FILE"
+for db in $DB_LIST; do
+    mysql_q "SELECT DISTINCT User,Host FROM mysql.db WHERE Db='$db';" 2>/dev/null >> "$USERS_FILE"
+done
+# Some setups grant via mysql.tables_priv too — include those.
+for db in $DB_LIST; do
+    mysql_q "SELECT DISTINCT User,Host FROM mysql.tables_priv WHERE Db='$db';" 2>/dev/null >> "$USERS_FILE"
+done
+# CWP convention: db users are typically named <cpuser>_*. Catch any that
+# match the cPanel-user prefix even if no row exists in mysql.db (rare,
+# but happens with custom grants).
+mysql_q "SELECT DISTINCT User,Host FROM mysql.user WHERE User LIKE '${USER_NAME}\\_%' ESCAPE '\\\\';" 2>/dev/null >> "$USERS_FILE"
+
+# Skip MySQL/MariaDB system accounts.
+SYS_USERS_RE='^(root|mysql\.sys|mysql\.session|mysql\.infoschema|mariadb\.sys|debian-sys-maint|cwpsrv|cwpdb)$'
+
+USER_COUNT=0
 {
     echo "-- MySQL users and grants for $USER_NAME"
-    for db in $DB_LIST; do
-        # find users with any privilege on this db
-        USERS="$(mysql_q "SELECT DISTINCT User,Host FROM mysql.db WHERE Db='$db';" 2>/dev/null)"
-        while IFS=$'\t' read -r u h; do
-            [[ -z "$u" ]] && continue
-            CREATE_STMT="$(mysql_q "SHOW CREATE USER \`$u\`@\`$h\`\G;" 2>/dev/null | sed 's/$/;/')"
-            [[ -n "$CREATE_STMT" ]] && echo "$CREATE_STMT" || true
-            mysql_q "SHOW GRANTS FOR \`$u\`@\`$h\`;" 2>/dev/null | sed 's/$/;/' || true
-        done <<< "$USERS"
+    echo "-- Generated $(date -u +%FT%TZ)"
+
+    # Dedupe (user, host) pairs.
+    sort -u "$USERS_FILE" | while IFS=$'\t' read -r u h; do
+        [[ -z "$u" ]] && continue
+        [[ "$u" =~ $SYS_USERS_RE ]] && continue
+
+        echo ""
+        echo "-- ----- ${u}@${h} -----"
+
+        if [[ "$HAVE_SHOW_CREATE_USER" -eq 1 ]]; then
+            # SHOW CREATE USER returns the full CREATE USER ... IDENTIFIED ...
+            # statement preserving the existing password hash and auth plugin.
+            CREATE_STMT="$(mysql $MYSQL_OPTS -NB -e "SHOW CREATE USER \`$u\`@\`$h\`;" 2>/dev/null)"
+            if [[ -n "$CREATE_STMT" ]]; then
+                # SHOW CREATE USER omits a trailing semicolon; add one.
+                # Also convert "CREATE USER" to "CREATE USER IF NOT EXISTS"
+                # so the restore is idempotent on cPanel servers that may
+                # have a clashing leftover user.
+                echo "${CREATE_STMT};" \
+                    | sed -E 's/^CREATE USER /CREATE USER IF NOT EXISTS /'
+            fi
+        else
+            # Legacy path: build CREATE USER from the password hash directly.
+            PWHASH="$(mysql_q "SELECT ${PW_COL} FROM mysql.user WHERE User='$u' AND Host='$h' LIMIT 1;" 2>/dev/null)"
+            if [[ -n "$PWHASH" ]]; then
+                echo "CREATE USER IF NOT EXISTS \`$u\`@\`$h\` IDENTIFIED BY PASSWORD '${PWHASH}';"
+            else
+                echo "CREATE USER IF NOT EXISTS \`$u\`@\`$h\`;"
+            fi
+        fi
+
+        # GRANT statements. SHOW GRANTS returns one per line, without ';'.
+        mysql $MYSQL_OPTS -NB -e "SHOW GRANTS FOR \`$u\`@\`$h\`;" 2>/dev/null \
+            | sed 's/$/;/'
+
+        USER_COUNT=$((USER_COUNT + 1))
     done
 } > "$STAGE/mysql.sql"
 
-# Ensure mysql.sql is not empty; create minimal stub if needed
-if [[ ! -s "$STAGE/mysql.sql" ]] || [[ $(wc -l < "$STAGE/mysql.sql") -le 1 ]]; then
-    echo "-- No MySQL users/grants found; cPanel will create defaults" > "$STAGE/mysql.sql"
+# Count and report so a silent miss is visible in the script output.
+EXPORTED_USERS="$(grep -c '^CREATE USER ' "$STAGE/mysql.sql" || true)"
+EXPORTED_GRANTS="$(grep -c '^GRANT ' "$STAGE/mysql.sql" || true)"
+echo "    Exported ${EXPORTED_USERS} DB user(s), ${EXPORTED_GRANTS} grant(s)."
+
+if [[ "$EXPORTED_USERS" -eq 0 && -n "$DB_LIST" ]]; then
+    echo "WARNING: no MySQL users were exported even though databases exist." >&2
+    echo "         cPanel will create the databases but they will have no DB users." >&2
+fi
+
+# Strip DEFINER clauses here too (rare in grants, but cheap insurance).
+sed -i -E \
+    -e 's/DEFINER=`[^`]*`@`[^`]*`//g' \
+    -e 's/SQL SECURITY DEFINER/SQL SECURITY INVOKER/g' \
+    "$STAGE/mysql.sql"
+
+# Ensure mysql.sql is not empty (cPanel tolerates an empty file but a
+# comment makes the archive easier to inspect).
+if [[ ! -s "$STAGE/mysql.sql" ]]; then
+    echo "-- No MySQL users/grants found for $USER_NAME" > "$STAGE/mysql.sql"
 fi
 
 #---------------------------------------------------------------------------
