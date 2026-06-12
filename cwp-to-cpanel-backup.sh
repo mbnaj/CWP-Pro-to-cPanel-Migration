@@ -363,6 +363,47 @@ for db in $DB_LIST; do
         if [[ -n "$SRC_TABLES" && "$SRC_TABLES" -gt 0 && "$DUMP_TABLES" -lt "$SRC_TABLES" ]]; then
             echo "WARNING: dump for '$db' contains $DUMP_TABLES CREATE TABLE statements but DB has $SRC_TABLES tables." >&2
             [[ -s "$DUMP_ERR" ]] && sed 's/^/         mysqldump: /' "$DUMP_ERR" >&2
+
+            # If mysqld can't write to /tmp (Aria/MyISAM .MAI temp files,
+            # Errcode 13), a single bad table aborts the whole-DB dump.
+            # Fall back to dumping table-by-table so we salvage what we
+            # can and clearly report which tables failed.
+            if grep -q "Permission denied\|Errcode: 13\|Couldn't execute" "$DUMP_ERR"; then
+                echo "         -> server-side /tmp permission issue detected; retrying table-by-table." >&2
+                echo "         -> Fix on server: 'chmod 1777 /tmp' (or set 'tmpdir' in my.cnf to a writable dir)." >&2
+
+                SALVAGE="$STAGE/mysql/${db}.sql.partial"
+                FAILED_TABLES=()
+                : > "$SALVAGE"
+                echo "-- Salvaged table-by-table dump of $db" >> "$SALVAGE"
+                echo "SET FOREIGN_KEY_CHECKS=0;" >> "$SALVAGE"
+
+                TABLES="$(mysql_q "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='$db' AND TABLE_TYPE='BASE TABLE';" 2>/dev/null)"
+                while IFS= read -r tbl; do
+                    [[ -z "$tbl" ]] && continue
+                    TBL_ERR="$WORK_DIR/mysqldump_${db}_${tbl}.err"
+                    if mysqldump $MYSQL_OPTS --max-allowed-packet=1G \
+                        --default-character-set=utf8mb4 --hex-blob \
+                        --skip-lock-tables --add-drop-table --quick \
+                        $GTID_OPT $COLSTATS_OPT $NOTBSP_OPT \
+                        "$db" "$tbl" >> "$SALVAGE" 2>"$TBL_ERR"; then
+                        :
+                    else
+                        FAILED_TABLES+=("$tbl")
+                        echo "         FAILED table: ${db}.${tbl}" >&2
+                        [[ -s "$TBL_ERR" ]] && sed 's/^/             /' "$TBL_ERR" >&2
+                    fi
+                done <<< "$TABLES"
+
+                echo "SET FOREIGN_KEY_CHECKS=1;" >> "$SALVAGE"
+                # Replace the truncated full-DB dump with the salvaged one.
+                mv "$SALVAGE" "$STAGE/mysql/${db}.sql"
+
+                if [[ ${#FAILED_TABLES[@]} -gt 0 ]]; then
+                    echo "WARNING: ${#FAILED_TABLES[@]} table(s) in '$db' could not be dumped: ${FAILED_TABLES[*]}" >&2
+                    echo "         These will be MISSING in the cPanel restore until the server-side /tmp issue is fixed." >&2
+                fi
+            fi
         fi
 
         # Strip DEFINER=`user`@`host` clauses. These are a very common
