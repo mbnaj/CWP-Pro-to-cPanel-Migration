@@ -35,7 +35,9 @@
 # database users. Re-set passwords for email accounts if hashes are not
 # compatible (cPanel expects $6$ SHA-512 crypt hashes in shadow).
 #
-set -u
+# NOTE: intentionally NOT using `set -u` — bash 4.2 (CentOS 7 / CWP7) treats
+# expansion of an empty array (e.g. "${ALL_DOMAINS[@]}") as an unbound
+# variable, which would abort the script on accounts with no addon domains.
 set -o pipefail
 
 #---------------------------------------------------------------------------

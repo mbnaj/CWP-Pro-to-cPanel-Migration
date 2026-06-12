@@ -73,6 +73,17 @@ sed -i 's/\r$//' cwp-to-cpanel-backup.sh
 sudo ./cwp-to-cpanel-backup.sh <cwp_username>
 ```
 
+### 4. `unbound variable` error around line ~128
+
+On CentOS 7 / CWP7 (bash 4.2) `set -u` aborts when an empty array is
+expanded — e.g. for an account that has no addon domains. The script no
+longer enables `set -u` for that reason. If you're running an older copy of
+the script that still has `set -u` near the top, simply remove that line:
+
+```bash
+sed -i '/^set -u$/d' cwp-to-cpanel-backup.sh
+```
+
 ## What is captured
 
 | Item | Destination in archive |
