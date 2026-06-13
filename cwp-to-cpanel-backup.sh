@@ -410,15 +410,42 @@ echo "$ALL_DBS" \
 
 # Source 3: grants for this user's MySQL accounts — pick up DBs the user
 # can access even if they don't carry the expected prefix.
+# NOTE: mysql.db.Db stores GRANT patterns, not literal DB names. CWP grants
+#       with escaped underscores ("benaa\_data"), which we must unescape
+#       before treating as a real DB name. Wildcard rows (containing % or
+#       a bare _) are skipped — they aren't a single DB.
 mysql_q "SELECT DISTINCT Db FROM mysql.db WHERE User LIKE '${PREFIX}\\_%' ESCAPE '\\\\';" \
-    2>/dev/null >> "$DB_TMP" || true
+    2>/dev/null \
+    | sed 's/\\_/_/g' \
+    | grep -v '%' \
+    >> "$DB_TMP" || true
 
 # Deduplicate, drop blanks, drop system schemas.
-DB_LIST="$(sort -u "$DB_TMP" \
+CANDIDATES="$(sort -u "$DB_TMP" \
     | awk 'NF' \
-    | grep -viE '^(mysql|information_schema|performance_schema|sys|root_cwp|cwp)$' \
-    | tr '\n' ' ')"
-DB_LIST="${DB_LIST% }"
+    | grep -viE '^(mysql|information_schema|performance_schema|sys|root_cwp|cwp)$')"
+
+# IMPORTANT: filter candidates against the live SHOW DATABASES list so we
+# never feed mysqldump a name that doesn't actually exist (otherwise we
+# hit "ERROR 1049 (42000): Unknown database 'xxx'").
+DB_LIST=""
+if [[ -n "$ALL_DBS" && -n "$CANDIDATES" ]]; then
+    # Build a sorted, deduped list of real DBs for join.
+    REAL_DBS_FILE="$WORK_DIR/real_dbs.list"
+    echo "$ALL_DBS" | sort -u > "$REAL_DBS_FILE"
+    CAND_FILE="$WORK_DIR/cand_dbs.list"
+    echo "$CANDIDATES" | sort -u > "$CAND_FILE"
+    DB_LIST="$(comm -12 "$REAL_DBS_FILE" "$CAND_FILE" | tr '\n' ' ')"
+    DB_LIST="${DB_LIST% }"
+
+    # Report any candidates that did NOT match a real DB — usually GRANT
+    # patterns or stale CWP rows pointing at deleted DBs.
+    MISSING="$(comm -23 "$CAND_FILE" "$REAL_DBS_FILE")"
+    if [[ -n "$MISSING" ]]; then
+        echo "    Ignoring candidate names that don't exist as real databases:" >&2
+        echo "$MISSING" | sed 's/^/        - /' >&2
+    fi
+fi
 
 if [[ -z "$DB_LIST" ]]; then
     echo "WARNING: no databases found for '$USER_NAME'." >&2
