@@ -229,13 +229,22 @@ echo "11.96.0.0" > "$STAGE/version"
 # 4. cPanel "cp/<user>" account metadata file
 #---------------------------------------------------------------------------
 CP_FILE="$STAGE/cp/$USER_NAME"
+PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 {
     echo "DNS=$PRIMARY_DOMAIN"
     echo "DOMAIN=$PRIMARY_DOMAIN"
     echo "USER=$USER_NAME"
     echo "OWNER=root"
     echo "PLAN=default"
-    echo "IP=$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "IP=$PRIMARY_IP"
+    # UID / GID / HOMEDIR are MANDATORY — cPanel's account registration
+    # inserts these into its internal tables, and NULL values trigger
+    # "column uid cannot be null" during restore.
+    echo "UID=$USER_UID"
+    echo "GID=$USER_GID"
+    echo "HOMEDIR=$USER_HOME"
+    echo "PARTITION=$(basename "$(dirname "$USER_HOME")")"
+    echo "SHELL=$USER_SHELL"
     echo "HASCGI=1"
     echo "MAXPOP=unlimited"
     echo "MAXFTP=unlimited"
@@ -250,6 +259,7 @@ CP_FILE="$STAGE/cp/$USER_NAME"
     echo "LANG=english"
     echo "STARTDATE=$(date +%s)"
     echo "SUSPENDED=0"
+    echo "CONTACTEMAIL="
 } > "$CP_FILE"
 
 # Create suspension data (SDS) stub files - cPanel expects these
@@ -278,10 +288,15 @@ for d in "${ALL_DOMAINS[@]}"; do
         echo "documentroot: $docroot"
         echo "group: $USER_NAME"
         echo "homedir: $USER_HOME"
-        echo "ip: $(hostname -I 2>/dev/null | awk '{print $1}')"
+        echo "ip: $PRIMARY_IP"
         echo "owner: root"
         echo "port: 80"
         echo "user: $USER_NAME"
+        # uid / gid here too — userdata is consumed by cPanel's Apache
+        # vhost rebuild and by suexec / mod_ruid2 which need real numeric
+        # IDs.
+        echo "uid: $USER_UID"
+        echo "gid: $USER_GID"
         echo "servername: $d"
         echo "serveralias: www.$d"
         echo "serveradmin: webmaster@$d"
@@ -352,11 +367,74 @@ if ! mysql $MYSQL_OPTS -NB -e "SELECT 1" >/dev/null 2>"$WORK_DIR/mysql_conn.err"
     echo "       Ensure /root/.my.cnf has working [client] credentials, then retry." >&2
 fi
 
-# CWP convention: dbs prefixed with <username>_  (sometimes root_<username>_)
-DB_LIST="$(mysql_q "SHOW DATABASES;" | grep -E "^(${USER_NAME}_|root_${USER_NAME}_)" || true)"
+#---------------------------------------------------------------------------
+# Database discovery (CWP is inconsistent about this — try several sources)
+#---------------------------------------------------------------------------
+# 1) CWP's own bookkeeping table: root_cwp.user_databases (newer CWP) or
+#    root_cwp.databases (older CWP) maps the cPanel user to their DB names.
+# 2) Fallback: information_schema match on common prefixes (case-insensitive):
+#       <user>_*    user_*    root_<user>_*
+# 3) Optional override: set CWP_DB_PREFIX=foo  to force the prefix used.
+#
+# This catches setups where the system username differs in case from the
+# CWP/MySQL prefix, or where DBs were created without the username prefix
+# but registered in CWP.
+#---------------------------------------------------------------------------
+
+DB_TMP="$WORK_DIR/db_candidates.list"
+: > "$DB_TMP"
+
+# Source 1: CWP user_databases table (newer schema).
+mysql_q "SELECT database_name FROM root_cwp.user_databases ud
+         JOIN root_cwp.user u ON ud.user_id = u.id
+         WHERE u.username='$USER_NAME';" 2>/dev/null >> "$DB_TMP" || true
+
+# Source 1b: CWP databases table (older schema).
+mysql_q "SELECT database_name FROM root_cwp.databases WHERE owner='$USER_NAME';" \
+    2>/dev/null >> "$DB_TMP" || true
+mysql_q "SELECT name FROM root_cwp.databases WHERE owner='$USER_NAME';" \
+    2>/dev/null >> "$DB_TMP" || true
+
+# Source 2: prefix match on information_schema (case-insensitive in MySQL).
+PREFIX="${CWP_DB_PREFIX:-$USER_NAME}"
+mysql_q "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA
+         WHERE SCHEMA_NAME LIKE '${PREFIX}\\_%' ESCAPE '\\\\'
+            OR SCHEMA_NAME LIKE 'root\\_${PREFIX}\\_%' ESCAPE '\\\\';" \
+    2>/dev/null >> "$DB_TMP" || true
+
+# Source 2b: try the old grep against SHOW DATABASES too (covers the rare
+# case where information_schema returns rows but our prefix match missed).
+ALL_DBS="$(mysql_q "SHOW DATABASES;" 2>/dev/null)"
+echo "$ALL_DBS" \
+    | grep -iE "^(${PREFIX}_|root_${PREFIX}_)" >> "$DB_TMP" 2>/dev/null || true
+
+# Source 3: grants for this user's MySQL accounts — pick up DBs the user
+# can access even if they don't carry the expected prefix.
+mysql_q "SELECT DISTINCT Db FROM mysql.db WHERE User LIKE '${PREFIX}\\_%' ESCAPE '\\\\';" \
+    2>/dev/null >> "$DB_TMP" || true
+
+# Deduplicate, drop blanks, drop system schemas.
+DB_LIST="$(sort -u "$DB_TMP" \
+    | awk 'NF' \
+    | grep -viE '^(mysql|information_schema|performance_schema|sys|root_cwp|cwp)$' \
+    | tr '\n' ' ')"
+DB_LIST="${DB_LIST% }"
 
 if [[ -z "$DB_LIST" ]]; then
-    echo "    (no databases found matching ${USER_NAME}_* or root_${USER_NAME}_*)"
+    echo "WARNING: no databases found for '$USER_NAME'." >&2
+    echo "         Tried prefixes: ${PREFIX}_, root_${PREFIX}_" >&2
+    echo "         Also checked CWP tables: root_cwp.user_databases, root_cwp.databases" >&2
+    if [[ -n "$ALL_DBS" ]]; then
+        echo "         Databases visible on this server:" >&2
+        echo "$ALL_DBS" | grep -viE '^(mysql|information_schema|performance_schema|sys)$' \
+            | sed 's/^/             /' >&2
+        echo "         If one of those belongs to $USER_NAME, re-run with:" >&2
+        echo "             CWP_DB_PREFIX=<correct_prefix> $0 $USER_NAME ..." >&2
+    else
+        echo "         (SHOW DATABASES returned nothing — check MySQL root credentials.)" >&2
+    fi
+else
+    echo "    Discovered databases: $DB_LIST"
 fi
 
 # Detect server flavour / version so we can pick safe mysqldump options.
@@ -546,10 +624,10 @@ done
 for db in $DB_LIST; do
     mysql_q "SELECT DISTINCT User,Host FROM mysql.tables_priv WHERE Db='$db';" 2>/dev/null >> "$USERS_FILE"
 done
-# CWP convention: db users are typically named <cpuser>_*. Catch any that
+# CWP convention: db users are typically named <prefix>_*. Catch any that
 # match the cPanel-user prefix even if no row exists in mysql.db (rare,
 # but happens with custom grants).
-mysql_q "SELECT DISTINCT User,Host FROM mysql.user WHERE User LIKE '${USER_NAME}\\_%' ESCAPE '\\\\';" 2>/dev/null >> "$USERS_FILE"
+mysql_q "SELECT DISTINCT User,Host FROM mysql.user WHERE User LIKE '${PREFIX}\\_%' ESCAPE '\\\\';" 2>/dev/null >> "$USERS_FILE"
 
 # Skip MySQL/MariaDB system accounts.
 SYS_USERS_RE='^(root|mysql\.sys|mysql\.session|mysql\.infoschema|mariadb\.sys|debian-sys-maint|cwpsrv|cwpdb)$'

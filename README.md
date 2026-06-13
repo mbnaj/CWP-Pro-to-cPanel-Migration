@@ -123,6 +123,32 @@ The script also prints explicit errors if `mysqldump` fails or if no
 databases match the CWP naming pattern (`<user>_*` or `root_<user>_*`),
 so re-run it and read the output if the dump is unexpectedly empty.
 
+## Troubleshooting: "no databases found for `<user>`"
+
+The script discovers databases from multiple sources, in this order:
+
+1. CWP's own bookkeeping tables (`root_cwp.user_databases`, `root_cwp.databases`).
+2. Prefix match against `information_schema` (case-insensitive) for
+   `<user>_*` and `root_<user>_*`.
+3. `mysql.db` grants whose `User` starts with `<user>_`.
+
+If none of these find your DBs, the script prints every database visible
+on the server and the prefixes it tried, so you can spot a mismatch.
+The most common cause is that the MySQL prefix differs from the system
+username (different casing, abbreviated prefix, or a manually-named DB).
+Override the prefix with the `CWP_DB_PREFIX` environment variable:
+
+```bash
+# System user is "almajdsms" but DBs are named "majdsms_*"
+sudo CWP_DB_PREFIX=majdsms ./cwp-to-cpanel-backup.sh almajdsms
+```
+
+You can also confirm directly with:
+
+```bash
+mysql -NB -e "SHOW DATABASES" | grep -i <user-or-prefix>
+```
+
 ## What is captured
 
 | Item | Destination in archive |
