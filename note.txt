@@ -1,0 +1,3 @@
+gzip -t /root/cpmove-backups/cpmove-<user>.tar.gz && echo "GZIP OK"
+tar -tzf /root/cpmove-backups/cpmove-<user>.tar.gz | wc -l    # should print thousands of entries
+ls -l /root/cpmove-backups/cpmove-<user>.tar.gz                # remember this byte count

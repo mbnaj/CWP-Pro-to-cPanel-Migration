@@ -806,23 +806,108 @@ fi
 #---------------------------------------------------------------------------
 ARCHIVE="$OUT_DIR/cpmove-${USER_NAME}.tar.gz"
 echo "==> Creating archive: $ARCHIVE"
-tar -C "$STAGE" -czf "$ARCHIVE" .
 
-# Cleanup staging
+# Pre-flight: how much do we need vs. how much is free in OUT_DIR? Gzip on
+# typical hosting data hits ~50% compression, so reserve at least
+# stage_size * 0.6 plus a 200 MB safety margin.
+STAGE_KB="$(du -sk "$STAGE" 2>/dev/null | awk '{print $1}')"
+FREE_KB="$(df -Pk "$OUT_DIR" | awk 'NR==2 {print $4}')"
+NEED_KB=$(( STAGE_KB * 6 / 10 + 200 * 1024 ))
+if [[ -n "$STAGE_KB" && -n "$FREE_KB" && "$FREE_KB" -lt "$NEED_KB" ]]; then
+    echo "ERROR: not enough free space in $OUT_DIR." >&2
+    echo "       Stage size : $(( STAGE_KB / 1024 )) MB" >&2
+    echo "       Estimated  : $(( NEED_KB / 1024 )) MB needed (incl. margin)" >&2
+    echo "       Available  : $(( FREE_KB / 1024 )) MB" >&2
+    echo "       Free up space or pass a different output_dir." >&2
+    rm -rf "$WORK_DIR"
+    exit 2
+fi
+
+# Build the tarball. Notes:
+#  - We pack the parent dir entry "cpmove-<user>" rather than "." so the
+#    archive contains a single top-level directory, which is the cpmove
+#    convention cPanel's restorepkg expects.
+#  - --warning=no-file-changed prevents tar from aborting if a file under
+#    $STAGE changes between stat and read (rare, but possible if mail is
+#    delivered into homedir during the dump). It still records the warning.
+#  - We intentionally do NOT use --remove-files; staging is kept until the
+#    archive verifies clean.
+#  - Use `set -o pipefail` was already on at script top, so a failing tar
+#    inside a pipe surfaces.
+TAR_LOG="$WORK_DIR/tar.log"
+TAR_RC=0
+tar --warning=no-file-changed -C "$WORK_DIR" -czf "$ARCHIVE" \
+    "cpmove-$USER_NAME" 2>"$TAR_LOG" || TAR_RC=$?
+
+if [[ $TAR_RC -ne 0 && $TAR_RC -ne 1 ]]; then
+    # tar exit codes: 0 = ok, 1 = some files changed (warning), 2 = fatal.
+    echo "ERROR: tar failed (exit $TAR_RC) while creating $ARCHIVE." >&2
+    [[ -s "$TAR_LOG" ]] && sed 's/^/       tar: /' "$TAR_LOG" >&2
+    echo "       Staging kept for inspection: $STAGE" >&2
+    exit 3
+fi
+if [[ $TAR_RC -eq 1 ]]; then
+    echo "    (tar reported file-changed warnings; archive should still be usable)"
+fi
+
+# Verify the gzip stream is intact (catches the "compressed file ended
+# before end-of-stream marker was reached" error).
+if ! gzip -t "$ARCHIVE" 2>"$WORK_DIR/gzip.err"; then
+    echo "ERROR: gzip integrity check failed for $ARCHIVE." >&2
+    [[ -s "$WORK_DIR/gzip.err" ]] && sed 's/^/       gzip: /' "$WORK_DIR/gzip.err" >&2
+    echo "       Likely causes: disk filled mid-write, process killed, or" >&2
+    echo "       a file vanished underneath tar. Staging kept: $STAGE" >&2
+    exit 4
+fi
+
+# Verify tar can read the whole archive end-to-end (catches the case where
+# gzip is valid but the embedded tar stream is short, e.g. truncated then
+# re-gzipped).
+if ! tar -tzf "$ARCHIVE" >/dev/null 2>"$WORK_DIR/tar_verify.err"; then
+    echo "ERROR: tar integrity check failed for $ARCHIVE." >&2
+    [[ -s "$WORK_DIR/tar_verify.err" ]] && sed 's/^/       tar: /' "$WORK_DIR/tar_verify.err" >&2
+    echo "       Staging kept for inspection: $STAGE" >&2
+    exit 5
+fi
+
+# All good — clean up.
 rm -rf "$WORK_DIR"
 
 SIZE="$(du -h "$ARCHIVE" | awk '{print $1}')"
+BYTES="$(stat -c %s "$ARCHIVE" 2>/dev/null || wc -c < "$ARCHIVE")"
+SHA256="$(sha256sum "$ARCHIVE" 2>/dev/null | awk '{print $1}')"
+# Write a sidecar checksum file so transfer integrity can be checked later.
+if [[ -n "$SHA256" ]]; then
+    echo "$SHA256  $(basename "$ARCHIVE")" > "${ARCHIVE}.sha256"
+fi
+
 echo
 echo "============================================================"
 echo " Backup complete."
-echo "   File : $ARCHIVE"
-echo "   Size : $SIZE"
+echo "   File   : $ARCHIVE"
+echo "   Size   : $SIZE  (${BYTES} bytes)"
+[[ -n "$SHA256" ]] && echo "   SHA256 : $SHA256"
 echo "============================================================"
 echo
+echo "IMPORTANT — transferring this archive:"
+echo "  This is a binary file. If you download it and it then opens with"
+echo "  'unexpected end of archive' or 'compressed file ended before"
+echo "  end-of-stream marker', the file was corrupted during transfer."
+echo "  Almost always: FTP in ASCII mode (or a web-based file manager"
+echo "  doing the same). Use one of these instead:"
+echo "    - scp  : scp root@<cwp-host>:$ARCHIVE ."
+echo "    - sftp : in BINARY mode"
+echo "    - rsync: rsync -av root@<cwp-host>:$ARCHIVE ./"
+echo "  After transfer, verify with:"
+echo "    sha256sum -c $(basename "$ARCHIVE").sha256"
+echo "  The SHA256 above MUST match on both sides."
+echo
 echo "Restore on cPanel/WHM:"
-echo "  1) Upload \"$ARCHIVE\" to /home on the cPanel server."
-echo "  2) WHM -> Transfers -> Restore a Full Backup/cpmove File."
-echo "  3) Enter user: $USER_NAME  and submit."
+echo "  1) Upload \"$ARCHIVE\" to /home on the cPanel server (binary mode)."
+echo "  2) On the cPanel server, verify the file is intact:"
+echo "       gzip -t $(basename "$ARCHIVE")  &&  echo OK"
+echo "  3) WHM -> Transfers -> Restore a Full Backup/cpmove File."
+echo "  4) Enter user: $USER_NAME  and submit."
 echo
 echo "After restore, please verify:"
 echo "  - Domain DNS records and SSL certificates."
